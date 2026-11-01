@@ -1,0 +1,812 @@
+#!/usr/bin/env python3
+"""
+claude-switch: switch accounts in Claude Desktop (macOS) while keeping the local workspace shared.
+
+How Claude Desktop (4.4xxx) stores things:
+  * Auth: claude.ai cookies (the Cookies file, sessionKey*) plus the oauth:tokenCache* keys in config.json.
+    Values are encrypted with the "Claude Safe Storage" Keychain key, which is the same for every account,
+    so a snapshot can simply be copied away and put back.
+  * Local Code and Cowork sessions live in <userData>/claude-code-sessions/<accountUuid>/<orgUuid>/
+    and <userData>/local-agent-mode-sessions/<accountUuid>/<orgUuid>/. Another account looks in another
+    folder, which is why chats seem to disappear.
+  * Symlinks don't work: the app opens these folders with O_NOFOLLOW and treats a symlink as tampering.
+    So on every switch the workspace folder is physically moved under the new account's IDs.
+  * lastKnownAccountUuid in config.json must match the account, otherwise on startup the app decides a
+    different person signed in and wipes its token cache and connectors.
+  * If Gateway (3P) mode is configured, an app started without a claude.ai sign-in drops the stored
+    "claude.ai" choice (deploymentMode in <userData>-3p/claude_desktop_config.json) and relaunches into
+    Gateway. So the script sets deploymentMode=1p and launches the app with --claude-first-party-sign-in,
+    the same way the app does when you pick "sign in with claude.ai".
+
+Everything is done while the app is closed. A backup is made before every switch.
+"""
+import argparse
+import copy
+import json
+import os
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+VERSION = "1.1.0"
+REPO = "qxlies/claude-switch"
+BUNDLE_ID = "com.anthropic.claudefordesktop"
+APP_DIR = Path(os.environ.get("CLAUDE_SWITCH_APPDIR", Path.home() / "Library/Application Support/Claude"))
+HOME = Path(os.environ.get("CLAUDE_SWITCH_HOME", Path.home() / ".claude-switch"))
+STATE_FILE = HOME / "state.json"
+LOG_FILE = HOME / "switch.log"
+KEEP_BACKUPS = 8
+# Where the app stores the claude.ai / Gateway mode choice
+MODE_FILE = APP_DIR.parent / (APP_DIR.name + "-3p") / "claude_desktop_config.json"
+FIRST_PARTY_FLAG = "--claude-first-party-sign-in"
+LOGIN_TIMEOUT = int(os.environ.get("CLAUDE_SWITCH_LOGIN_TIMEOUT", 900))
+
+# Web profile files that belong to an account
+AUTH_PATHS = ["Cookies", "Cookies-journal", "Local Storage", "Session Storage", "IndexedDB"]
+# config.json keys that belong to an account
+AUTH_KEYS = [
+    "oauth:tokenCache",
+    "oauth:tokenCacheV2",
+    "lastKnownAccountUuid",
+    "bootSideSessions",
+    "sshTransportFlagLastAnswer",
+    "windowSizeWasSignedIn",
+    "coworkTrustedDeviceToken",
+]
+# Workspace folders, keyed by <acct>/<org>
+WORKSPACE_DIRS = ["claude-code-sessions", "local-agent-mode-sessions"]
+# Per-account settings that are NOT carried over (server-side gates and rate-limit counters)
+PREF_DENY = ("bypassPermissionsGateByAccount", "autoResumeRateLimit", "auto-mode-denial-count")
+
+NO_APP = False  # --no-app: don't touch the app itself (for tests)
+
+
+# ───────────────────────── helpers ─────────────────────────
+
+def log(msg):
+    line = f"[{datetime.now():%H:%M:%S}] {msg}"
+    print(line, flush=True)
+
+
+def die(msg, code=1):
+    log(f"ERROR: {msg}")
+    notify(msg, "Claude Switch: error")
+    sys.exit(code)
+
+
+def notify(text, title="Claude Switch"):
+    if NO_APP:
+        return
+    subprocess.run(["osascript", "-e", f"display notification {json.dumps(text)} with title {json.dumps(title)}"],
+                   capture_output=True)
+
+
+def read_json(path, default=None):
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return default
+    return json.loads(raw)
+
+
+def write_json(path, data):
+    """Atomic write that keeps the original file's indentation and trailing newline."""
+    path = Path(path)
+    indent, trailing = 2, ""
+    if path.exists():
+        raw = path.read_text(encoding="utf-8")
+        trailing = "\n" if raw.endswith("\n") else ""
+        if raw.startswith("{\n\t"):
+            indent = "\t"
+        elif raw.startswith("{\n"):
+            indent = len(raw[2:]) - len(raw[2:].lstrip(" ")) or 2
+        elif raw.startswith("{") and not raw.startswith("{\n"):
+            indent = None
+    tmp = path.with_name(path.name + ".claude-switch.tmp")
+    tmp.write_text(json.dumps(data, indent=indent, ensure_ascii=False) + trailing, encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def rm(path):
+    path = Path(path)
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def copy_any(src, dst):
+    src, dst = Path(src), Path(dst)
+    rm(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src.is_dir():
+        shutil.copytree(src, dst, symlinks=True)
+    else:
+        shutil.copy2(src, dst)
+
+
+def short(uuid):
+    return (uuid or "?")[:8]
+
+
+# ───────────────────────── state ─────────────────────────
+
+def load_state():
+    st = read_json(STATE_FILE, None) or {}
+    st.setdefault("profiles", {})
+    st.setdefault("workspace", None)  # {"acct":..., "org":...}: where the workspace physically lives now
+    return st
+
+
+def save_state(st):
+    HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, STATE_FILE)
+
+
+def profile_dir(name):
+    return HOME / "profiles" / name
+
+
+def profile_by_acct(st, acct):
+    for name, p in st["profiles"].items():
+        if p.get("accountUuid") == acct:
+            return name
+    return None
+
+
+# ───────────────────────── the app ─────────────────────────
+
+def app_pid():
+    r = subprocess.run(["lsappinfo", "info", "-only", "pid", "-app", BUNDLE_ID], capture_output=True, text=True)
+    for tok in r.stdout.replace('"', " ").replace("=", " ").split():
+        if tok.isdigit():
+            return int(tok)
+    return None
+
+
+def app_running():
+    if NO_APP:
+        return False
+    r = subprocess.run(["osascript", "-e", f'application id "{BUNDLE_ID}" is running'], capture_output=True, text=True)
+    return r.stdout.strip() == "true"
+
+
+def quit_app(force=False, timeout=60):
+    if not app_running():
+        return
+    log("Quitting Claude… (confirm if the app asks)")
+    subprocess.run(["osascript", "-e", f'tell application id "{BUNDLE_ID}" to quit'], capture_output=True)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not app_running():
+            time.sleep(1.5)  # let it finish writing config.json and cookies
+            return
+        time.sleep(1)
+    pid = app_pid()
+    if force and pid:
+        log(f"Claude did not quit within {timeout}s, sending SIGTERM (pid {pid})")
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(20):
+            time.sleep(1)
+            if not app_running():
+                time.sleep(1.5)
+                return
+        die("Claude still did not quit. Quit it manually (⌘Q) and try again.")
+    die("Claude did not quit. Quit it manually (⌘Q) and try again, or run with --force.")
+
+
+def force_first_party():
+    """Keep the app out of Gateway mode: the mode choice must be claude.ai (1p)."""
+    d = read_json(MODE_FILE)
+    if d is not None and d.get("deploymentMode") != "1p":
+        log(f"App mode was '{d.get('deploymentMode') or 'not chosen'}', setting it to claude.ai")
+        d["deploymentMode"] = "1p"
+        write_json(MODE_FILE, d)
+
+
+def launch_app():
+    force_first_party()
+    if NO_APP:
+        return
+    subprocess.run(["open", "-b", BUNDLE_ID, "--args", FIRST_PARTY_FLAG])
+
+
+# ───────────────────────── current account ─────────────────────────
+
+def app_config():
+    return read_json(APP_DIR / "config.json", {}) or {}
+
+
+def has_session_cookie():
+    db = APP_DIR / "Cookies"
+    if not db.exists():
+        return False
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+        n = con.execute("select count(*) from cookies where host_key like '%claude.ai' and name like 'sessionKey%'").fetchone()[0]
+        con.close()
+        return n > 0
+    except sqlite3.Error:
+        return False
+
+
+def current_account():
+    cfg = app_config()
+    acct = cfg.get("lastKnownAccountUuid")
+    logged_in = bool(acct) and bool(cfg.get("oauth:tokenCacheV2") or cfg.get("oauth:tokenCache") or has_session_cookie())
+    return acct if logged_in else None
+
+
+def org_dirs(acct):
+    found = {}
+    for fam in WORKSPACE_DIRS:
+        base = APP_DIR / fam / acct
+        if base.is_dir():
+            for d in base.iterdir():
+                if d.is_dir() and len(d.name) == 36:
+                    found[d.name] = max(found.get(d.name, 0), d.stat().st_mtime)
+    return found
+
+
+def detect_org(acct, cfg=None):
+    cfg = cfg if cfg is not None else app_config()
+    s = cfg.get("sshTransportFlagLastAnswer") or {}
+    if s.get("accountUuid") == acct and s.get("orgUuid"):
+        return s["orgUuid"]
+    prefs = (read_json(APP_DIR / "claude_desktop_config.json", {}) or {}).get("preferences", {})
+    for v in (prefs.get("epitaxyPrefs") or {}).values():
+        if isinstance(v, dict):
+            for k in v:
+                if isinstance(k, str) and k.startswith(acct + "/"):
+                    return k.split("/", 1)[1]
+    dirs = org_dirs(acct)
+    if dirs:
+        return max(dirs, key=dirs.get)
+    stamps = {k.rsplit(":", 1)[1]: v for k, v in cfg.items() if k.startswith("dxt:allowlistLastUpdated:")}
+    if stamps:
+        return max(stamps, key=stamps.get)
+    return None
+
+
+# ───────────────────────── auth snapshots ─────────────────────────
+
+def snapshot_auth(name):
+    """Save the sign-in currently in the app into profile `name`. The app must be closed."""
+    pdir = profile_dir(name) / "auth"
+    tmp = pdir.with_name("auth.tmp")
+    rm(tmp)
+    tmp.mkdir(parents=True)
+    for p in AUTH_PATHS:
+        if (APP_DIR / p).exists():
+            copy_any(APP_DIR / p, tmp / p)
+    cfg = app_config()
+    keys = {k: cfg[k] for k in AUTH_KEYS if k in cfg}
+    (tmp / "config-keys.json").write_text(json.dumps(keys, indent=2), encoding="utf-8")
+    rm(pdir)
+    tmp.rename(pdir)
+    for d in (HOME / "profiles", profile_dir(name), pdir):
+        os.chmod(d, 0o700)
+
+
+def clear_auth():
+    """Put the app into the signed-out state without touching the workspace or settings."""
+    for p in AUTH_PATHS:
+        rm(APP_DIR / p)
+    cfg = app_config()
+    for k in AUTH_KEYS:
+        cfg.pop(k, None)
+    write_json(APP_DIR / "config.json", cfg)
+
+
+def restore_auth(name):
+    pdir = profile_dir(name) / "auth"
+    if not pdir.is_dir():
+        log(f"Profile '{name}' has no saved sign-in yet: Claude will open on the sign-in screen.")
+        clear_auth()
+        return False
+    for p in AUTH_PATHS:
+        rm(APP_DIR / p)
+        if (pdir / p).exists():
+            copy_any(pdir / p, APP_DIR / p)
+    keys = read_json(pdir / "config-keys.json", {}) or {}
+    cfg = app_config()
+    for k in AUTH_KEYS:
+        cfg.pop(k, None)
+    cfg.update(keys)
+    write_json(APP_DIR / "config.json", cfg)
+    return True
+
+
+# ───────────────────────── workspace ─────────────────────────
+
+def merge_move(src, dst, conflicts):
+    """Move src into dst. On a conflict src (the workspace being carried) wins; dst's copy goes to `conflicts`."""
+    if not src.exists():
+        return
+    if not dst.exists():
+        dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.rename(src, dst)
+        return
+    for entry in list(src.iterdir()):
+        target = dst / entry.name
+        if not target.exists():
+            os.rename(entry, target)
+        elif entry.is_dir() and target.is_dir():
+            merge_move(entry, target, conflicts / entry.name)
+        else:
+            conflicts.mkdir(parents=True, exist_ok=True)
+            os.rename(target, conflicts / entry.name)
+            os.rename(entry, target)
+    try:
+        src.rmdir()
+    except OSError:
+        pass
+
+
+def move_workspace(src_acct, src_org, dst_acct, dst_org, backup_dir):
+    if (src_acct, src_org) == (dst_acct, dst_org):
+        return
+    log(f"Moving workspace {short(src_acct)}/{short(src_org)} → {short(dst_acct)}/{short(dst_org)}")
+    for fam in WORKSPACE_DIRS:
+        src = APP_DIR / fam / src_acct / src_org
+        dst = APP_DIR / fam / dst_acct / dst_org
+        merge_move(src, dst, backup_dir / "conflicts" / fam)
+        try:
+            (APP_DIR / fam / src_acct).rmdir()  # drop the now-empty account folder
+        except OSError:
+            pass
+
+
+def copy_prefs(src_acct, src_org, dst_acct, dst_org):
+    """Copy per-account settings (sidebar groups and sections, permission modes, presets)."""
+    if src_acct == dst_acct and src_org == dst_org:
+        return
+    path = APP_DIR / "claude_desktop_config.json"
+    d = read_json(path)
+    if d:
+        prefs = d.get("preferences", {})
+        for k, v in list(prefs.items()):
+            if k.endswith("ByAccount") and isinstance(v, dict) and k not in PREF_DENY and src_acct in v:
+                v[dst_acct] = copy.deepcopy(v[src_acct])
+        ep = prefs.get("epitaxyPrefs") or {}
+        src_pair, dst_pair = f"{src_acct}/{src_org}", f"{dst_acct}/{dst_org}"
+        for k, v in list(ep.items()):
+            if any(x in k for x in PREF_DENY):
+                continue
+            if k.endswith("." + src_acct):
+                ep[k[: -len(src_acct)] + dst_acct] = copy.deepcopy(v)
+            elif isinstance(v, dict) and src_pair in v:
+                v[dst_pair] = copy.deepcopy(v[src_pair])
+        write_json(path, d)
+    path = APP_DIR / "ccd-session-presets.json"
+    d = read_json(path)
+    if d and src_acct in d.get("byAccount", {}):
+        d["byAccount"][dst_acct] = copy.deepcopy(d["byAccount"][src_acct])
+        write_json(path, d)
+
+
+def make_backup(tag):
+    bdir = HOME / "backups" / f"{datetime.now():%Y%m%d-%H%M%S-%f}-{tag}"
+    bdir.mkdir(parents=True)
+    for f in ["config.json", "claude_desktop_config.json", "ccd-session-presets.json"]:
+        if (APP_DIR / f).exists():
+            shutil.copy2(APP_DIR / f, bdir / f)
+    for fam in WORKSPACE_DIRS:
+        if (APP_DIR / fam).is_dir():
+            shutil.copytree(APP_DIR / fam, bdir / fam, symlinks=True,
+                            ignore=shutil.ignore_patterns("skills-plugin", "rpm"))
+    old = sorted((HOME / "backups").iterdir())
+    for b in old[:-KEEP_BACKUPS]:
+        shutil.rmtree(b, ignore_errors=True)
+    return bdir
+
+
+# ───────────────────────── commands ─────────────────────────
+
+def ensure_registered(st, acct, name=None):
+    """Register the current account as a profile if it isn't one yet."""
+    existing = profile_by_acct(st, acct)
+    if existing:
+        org = detect_org(acct)
+        if org and org != st["profiles"][existing].get("orgUuid") and org in org_dirs(acct):
+            st["profiles"][existing]["orgUuid"] = org
+        return existing
+    name = name or f"account-{short(acct)}"
+    org = detect_org(acct)
+    if not org:
+        die("Could not detect the current account's organization. Open the Code tab in Claude and try again.")
+    st["profiles"][name] = {"accountUuid": acct, "orgUuid": org, "addedAt": datetime.now().isoformat(timespec="seconds")}
+    log(f"Current account saved as profile '{name}' ({short(acct)}/{short(org)})")
+    return name
+
+
+def init_workspace(st):
+    if st["workspace"]:
+        return
+    acct = current_account()
+    if acct:
+        name = profile_by_acct(st, acct)
+        if name:
+            p = st["profiles"][name]
+            st["workspace"] = {"acct": p["accountUuid"], "org": p["orgUuid"]}
+
+
+def cmd_save(args):
+    st = load_state()
+    acct = current_account()
+    if not acct:
+        die("Nobody is signed in to Claude right now.")
+    name = args.name
+    if name in st["profiles"] and st["profiles"][name]["accountUuid"] != acct:
+        die(f"Profile '{name}' already belongs to another account.")
+    old = profile_by_acct(st, acct)
+    if old and old != name:
+        st["profiles"][name] = st["profiles"].pop(old)
+        if profile_dir(old).exists():
+            profile_dir(old).rename(profile_dir(name))
+        log(f"Profile '{old}' renamed to '{name}'")
+    else:
+        ensure_registered(st, acct, name)
+    init_workspace(st)
+    save_state(st)
+    log(f"Done. Profiles: {', '.join(st['profiles'])}")
+
+
+def attach_workspace(st, name, bdir):
+    """Move the workspace (sessions + settings) to where profile `name`'s account will look for it."""
+    tp = st["profiles"][name]
+    ws = st["workspace"]
+    if ws:
+        move_workspace(ws["acct"], ws["org"], tp["accountUuid"], tp["orgUuid"], bdir)
+        copy_prefs(ws["acct"], ws["org"], tp["accountUuid"], tp["orgUuid"])
+    st["workspace"] = {"acct": tp["accountUuid"], "org": tp["orgUuid"]}
+    st["active"] = name
+    save_state(st)
+
+
+def workspace_mismatch(st):
+    """Profile name of the current sign-in if the workspace is not under it (signed in outside the script)."""
+    cur = current_account()
+    ws = st.get("workspace")
+    if not cur or not ws or ws["acct"] == cur:
+        return None
+    return profile_by_acct(st, cur) or f"account-{short(cur)}"
+
+
+def do_switch(st, target, force):
+    """The main operation: snapshot the current sign-in → restore `target` → move the workspace."""
+    tp = st["profiles"][target]
+    quit_app(force)
+    cur = current_account()
+    cur_name = ensure_registered(st, cur) if cur else None
+    init_workspace(st)
+    if cur_name == target:
+        log(f"Profile '{target}' is already active.")
+        save_state(st)
+        launch_app()
+        return
+    bdir = make_backup(f"to-{target}")
+    log(f"Backup: {bdir}")
+    if cur_name:
+        snapshot_auth(cur_name)
+        log(f"Sign-in for '{cur_name}' saved")
+    restore_auth(target)
+    attach_workspace(st, target, bdir)
+    log(f"Switched to '{target}'. Launching Claude.")
+    notify(f"Active account: {target}")
+    launch_app()
+
+
+def cmd_use(args):
+    st = load_state()
+    if args.name not in st["profiles"]:
+        die(f"No profile '{args.name}'. Available: {', '.join(st['profiles']) or 'none'}")
+    do_switch(st, args.name, args.force)
+
+
+def cmd_add(args):
+    st = load_state()
+    if args.name in st["profiles"]:
+        die(f"Profile '{args.name}' already exists.")
+    quit_app(args.force)
+    cur = current_account()
+    cur_name = ensure_registered(st, cur) if cur else None
+    init_workspace(st)
+    bdir = make_backup(f"add-{args.name}")
+    log(f"Backup: {bdir}")
+    if cur_name:
+        snapshot_auth(cur_name)
+        log(f"Sign-in for '{cur_name}' saved")
+    clear_auth()
+    save_state(st)
+    launch_app()
+    log(f"Sign in to Claude with the new account (via claude.ai). Waiting up to {LOGIN_TIMEOUT // 60} minutes…")
+    notify(f"Sign in to Claude as '{args.name}'")
+    deadline = time.time() + LOGIN_TIMEOUT
+    new_acct = None
+    while time.time() < deadline:
+        time.sleep(2)
+        cfg = app_config()
+        a = cfg.get("lastKnownAccountUuid")
+        if a and (cfg.get("oauth:tokenCacheV2") or has_session_cookie()):
+            new_acct = a
+            break
+    if not new_acct:
+        log("No sign-in detected. Profile not created, restoring the previous account.")
+        quit_app(True)
+        if cur_name:
+            restore_auth(cur_name)
+        launch_app()
+        die(f"Timed out waiting for the new sign-in, restored '{cur_name or 'the previous state'}'.")
+    log(f"Sign-in detected: {short(new_acct)}. Waiting for the app to resolve the organization…")
+    org = None
+    for _ in range(45):
+        cfg = app_config()
+        s = cfg.get("sshTransportFlagLastAnswer") or {}
+        if s.get("accountUuid") == new_acct and s.get("orgUuid"):
+            org = s["orgUuid"]
+            break
+        time.sleep(2)
+    finish_add(st, args.name, new_acct, org, bdir, args.force)
+
+
+def finish_add(st, name, acct, org, bdir, force):
+    quit_app(force)
+    acct = acct or current_account()
+    if not acct:
+        die("Nobody is signed in to Claude.")
+    existing = profile_by_acct(st, acct)
+    if existing:
+        log(f"This account is already saved as '{existing}', switching to it.")
+        name = existing
+    else:
+        org = org or detect_org(acct)
+        if not org:
+            die("Could not detect the new account's organization.")
+        st["profiles"][name] = {"accountUuid": acct, "orgUuid": org,
+                                "addedAt": datetime.now().isoformat(timespec="seconds")}
+    tp = st["profiles"][name]
+    snapshot_auth(name)
+    attach_workspace(st, name, bdir)
+    log(f"Profile '{name}' added and active ({short(tp['accountUuid'])}/{short(tp['orgUuid'])}).")
+    notify(f"Account '{name}' added, workspace moved")
+    launch_app()
+
+
+def cmd_finish_add(args):
+    st = load_state()
+    finish_add(st, args.name, None, None, make_backup(f"finish-{args.name}"), args.force)
+
+
+def cmd_sync(args):
+    """Bring the workspace over to the account that is signed in now (after signing in outside the script)."""
+    st = load_state()
+    if not workspace_mismatch(st):
+        log("Chats are already under the current account, nothing to move.")
+        return
+    quit_app(args.force)
+    cur = current_account()
+    name = ensure_registered(st, cur)
+    bdir = make_backup(f"sync-{name}")
+    log(f"Backup: {bdir}")
+    attach_workspace(st, name, bdir)
+    log(f"Chats moved to the current account '{name}'. Launching Claude.")
+    notify(f"Chats moved to account '{name}'")
+    launch_app()
+
+
+def cmd_list(args):
+    st = load_state()
+    cur = current_account()
+    ws = st.get("workspace") or {}
+    if not st["profiles"]:
+        print("No profiles yet. Start with:  claude-switch save <name>")
+    for name, p in st["profiles"].items():
+        mark = "●" if p["accountUuid"] == cur else " "
+        has = "sign-in saved" if (profile_dir(name) / "auth").is_dir() else ("active" if mark == "●" else "no sign-in")
+        wsm = "  ← workspace" if ws.get("acct") == p["accountUuid"] else ""
+        print(f" {mark} {name:<20} {short(p['accountUuid'])}/{short(p['orgUuid'])}  {has}{wsm}")
+    if cur and not profile_by_acct(st, cur):
+        print(f" ● (not saved)           {short(cur)}  ← current sign-in, save it: claude-switch save <name>")
+    if workspace_mismatch(st):
+        print("\n ⚠ Chats are under another account, not the current sign-in. Move them: claude-switch sync")
+
+
+def cmd_remove(args):
+    st = load_state()
+    p = st["profiles"].get(args.name)
+    if not p:
+        die(f"No profile '{args.name}'.")
+    if p["accountUuid"] == current_account():
+        die("Can't remove the active profile. Switch to another one first.")
+    st["profiles"].pop(args.name)
+    rm(profile_dir(args.name))
+    save_state(st)
+    log(f"Profile '{args.name}' removed (sessions and workspace untouched).")
+
+
+def cmd_gui(args):
+    """Account menu built from standard macOS dialogs."""
+    st = load_state()
+    cur = current_account()
+    items = []
+    for name, p in st["profiles"].items():
+        items.append(("● " if p["accountUuid"] == cur else "    ") + name)
+    add_label = "＋ Add account…"
+    save_label = "Save current sign-in as…"
+    sync_label = "⟳ Move chats to the current account"
+    items.append(add_label)
+    if cur and not profile_by_acct(st, cur):
+        items.append(save_label)
+    if workspace_mismatch(st):
+        items.insert(0, sync_label)
+    script = (f"choose from list {applescript_list(items)} with title \"Claude Switch\" "
+              f"with prompt \"Claude account (shared workspace):\" OK button name \"Switch\" cancel button name \"Cancel\"")
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    choice = r.stdout.strip()
+    if not choice or choice == "false":
+        return
+    if choice == sync_label:
+        spawn_detached(["sync", "--force"])
+        return
+    if choice in (add_label, save_label):
+        default = "" if choice == add_label else f"account-{short(cur)}"
+        r = subprocess.run(["osascript", "-e",
+                            f'text returned of (display dialog "Profile name (letters, digits, - _ . no spaces):" '
+                            f'default answer "{default}" with title "Claude Switch")'], capture_output=True, text=True)
+        name = r.stdout.strip()
+        if not name:
+            return
+        if choice == save_label:
+            cmd_save(argparse.Namespace(name=name))
+            return
+        spawn_detached(["add", name, "--force"])
+        return
+    name = choice.lstrip("● ").strip()
+    if st["profiles"].get(name, {}).get("accountUuid") == cur:
+        return
+    spawn_detached(["use", name, "--force"])
+
+
+def applescript_list(items):
+    return "{" + ", ".join(json.dumps(i, ensure_ascii=False) for i in items) + "}"
+
+
+def spawn_detached(argv):
+    """Run a command in its own session so quitting Claude doesn't kill it (matters inside Claude's terminal)."""
+    HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
+    env = dict(os.environ, CLAUDE_SWITCH_WORKER="1")
+    with open(LOG_FILE, "a") as lf:
+        lf.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} {' '.join(argv)}\n")
+        proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), *argv], stdin=subprocess.DEVNULL,
+                                stdout=lf, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    return proc
+
+
+def run_worker_and_follow(argv):
+    """CLI: start the worker detached and stream its log while it runs."""
+    start = LOG_FILE.stat().st_size if LOG_FILE.exists() else 0
+    proc = spawn_detached(argv)
+    pos = start
+    try:
+        while True:
+            time.sleep(0.5)
+            with open(LOG_FILE) as lf:
+                lf.seek(pos)
+                chunk = lf.read()
+                pos = lf.tell()
+            if chunk:
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+            if proc.poll() is not None:
+                return proc.returncode
+    except KeyboardInterrupt:
+        print(f"\nThe worker keeps running in the background, log: {LOG_FILE}")
+        return 0
+
+
+def cmd_install(args):
+    bindir = Path.home() / ".local/bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    target = bindir / "claude-switch"
+    if Path(__file__).resolve() != target.resolve():
+        shutil.copy2(__file__, target)
+    os.chmod(target, 0o755)
+    log(f"CLI installed: {target}")
+    if str(bindir) not in os.environ.get("PATH", "").split(":") and not os.environ.get("CLAUDE_SWITCH_INSTALLER"):
+        log("Add this to ~/.zshrc:  export PATH=\"$HOME/.local/bin:$PATH\"")
+    app = Path.home() / "Applications" / "Claude Switch.app"
+    app.parent.mkdir(exist_ok=True)
+    py = sys.executable
+    src = f'do shell script quoted form of "{py}" & " " & quoted form of "{target}" & " gui"'
+    rm(app)
+    subprocess.run(["osacompile", "-o", str(app), "-e", src], check=True)
+    icon = Path("/Applications/Claude.app/Contents/Resources/electron.icns")
+    if icon.exists():
+        shutil.copy2(icon, app / "Contents/Resources/applet.icns")
+        subprocess.run(["touch", str(app)])
+    log(f"Switcher app: {app} (find it in Spotlight as 'Claude Switch')")
+
+
+def cmd_uninstall(args):
+    for p in (Path.home() / ".local/bin/claude-switch", Path.home() / "Applications" / "Claude Switch.app"):
+        if p.exists():
+            rm(p)
+            log(f"Removed: {p}")
+    if args.purge:
+        st = load_state()
+        ws = st.get("workspace")
+        cur = current_account()
+        if ws and cur and ws["acct"] != cur:
+            die("Chats are not under the current account right now. Run `claude-switch sync` first, then --purge.")
+        rm(HOME)
+        log(f"Removed profiles, saved sign-ins and backups: {HOME}")
+    else:
+        log(f"Profiles and backups kept in {HOME} (remove everything: claude-switch uninstall --purge)")
+
+
+def cmd_update(args):
+    url = f"https://raw.githubusercontent.com/{REPO}/main/install.sh"
+    log(f"Updating from {url}")
+    sys.exit(subprocess.run(["/bin/bash", "-c", f"curl -fsSL {url} | bash"]).returncode)
+
+
+def main():
+    global NO_APP
+    ap = argparse.ArgumentParser(prog="claude-switch",
+                                 description="Switch Claude Desktop accounts while keeping local chats shared.")
+    ap.add_argument("--no-app", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--version", action="version", version=f"claude-switch {VERSION}")
+    sub = ap.add_subparsers(dest="cmd", metavar="command")
+    s = sub.add_parser("save", help="save the current sign-in as a profile (or rename it)")
+    s.add_argument("name")
+    s = sub.add_parser("add", help="add a new account: Claude opens on the sign-in screen")
+    s.add_argument("name")
+    s.add_argument("--force", action="store_true", help="force-quit Claude if it doesn't quit on its own")
+    s = sub.add_parser("use", help="switch to a profile")
+    s.add_argument("name")
+    s.add_argument("--force", action="store_true", help="force-quit Claude if it doesn't quit on its own")
+    s = sub.add_parser("_finish-add")
+    s.add_argument("name")
+    s.add_argument("--force", action="store_true")
+    s = sub.add_parser("sync", help="move chats to the account that is signed in now (if you signed in outside the script)")
+    s.add_argument("--force", action="store_true", help="force-quit Claude if it doesn't quit on its own")
+    sub.add_parser("list", help="list profiles")
+    s = sub.add_parser("remove", help="remove a profile (only its saved sign-in)")
+    s.add_argument("name")
+    sub.add_parser("gui", help="account menu in a macOS dialog")
+    sub.add_parser("install", help="install the CLI to ~/.local/bin and the 'Claude Switch' app to ~/Applications")
+    sub.add_parser("update", help="update to the latest version from GitHub")
+    s = sub.add_parser("uninstall", help="remove the CLI and the 'Claude Switch' app")
+    s.add_argument("--purge", action="store_true", help="also remove profiles, saved sign-ins and backups")
+    args = ap.parse_args()
+    NO_APP = args.no_app
+    name = getattr(args, "name", None)
+    if name is not None and not name.replace("-", "").replace("_", "").replace(".", "").isalnum():
+        die("Profile name: letters, digits, '-', '_', '.', no spaces.")
+
+    if args.cmd in ("use", "add", "sync") and not os.environ.get("CLAUDE_SWITCH_WORKER") and not NO_APP:
+        argv = [args.cmd] + ([args.name] if name else []) + (["--force"] if args.force else [])
+        sys.exit(run_worker_and_follow(argv))
+
+    handlers = {"save": cmd_save, "add": cmd_add, "use": cmd_use, "_finish-add": cmd_finish_add, "sync": cmd_sync,
+                "list": cmd_list, "remove": cmd_remove, "gui": cmd_gui, "install": cmd_install,
+                "update": cmd_update, "uninstall": cmd_uninstall}
+    if not args.cmd:
+        cmd_list(args)
+        print("\nCommands: save <name> | add <name> | use <name> | sync | list | remove <name> | gui | update | uninstall"
+              "\nMore: claude-switch --help")
+        return
+    handlers[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
