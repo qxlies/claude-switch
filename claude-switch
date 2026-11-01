@@ -33,13 +33,15 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 REPO = "qxlies/claude-switch"
 BUNDLE_ID = "com.anthropic.claudefordesktop"
+APP_BUNDLE_ID = "io.github.qxlies.claude-switch"
 APP_DIR = Path(os.environ.get("CLAUDE_SWITCH_APPDIR", Path.home() / "Library/Application Support/Claude"))
 HOME = Path(os.environ.get("CLAUDE_SWITCH_HOME", Path.home() / ".claude-switch"))
 STATE_FILE = HOME / "state.json"
 LOG_FILE = HOME / "switch.log"
+LOCK_FILE = HOME / "worker.lock"
 KEEP_BACKUPS = 8
 # Where the app stores the claude.ai / Gateway mode choice
 MODE_FILE = APP_DIR.parent / (APP_DIR.name + "-3p") / "claude_desktop_config.json"
@@ -63,7 +65,7 @@ WORKSPACE_DIRS = ["claude-code-sessions", "local-agent-mode-sessions"]
 # Per-account settings that are NOT carried over (server-side gates and rate-limit counters)
 PREF_DENY = ("bypassPermissionsGateByAccount", "autoResumeRateLimit", "auto-mode-denial-count")
 
-NO_APP = False  # --no-app: don't touch the app itself (for tests)
+NO_APP = bool(os.environ.get("CLAUDE_SWITCH_NO_APP"))  # --no-app: don't touch the app itself (for tests)
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -80,7 +82,7 @@ def die(msg, code=1):
 
 
 def notify(text, title="Claude Switch"):
-    if NO_APP:
+    if NO_APP or os.environ.get("CLAUDE_SWITCH_NO_NOTIFY"):  # the app shows its own progress
         return
     subprocess.run(["osascript", "-e", f"display notification {json.dumps(text)} with title {json.dumps(title)}"],
                    capture_output=True)
@@ -133,6 +135,26 @@ def copy_any(src, dst):
 
 def short(uuid):
     return (uuid or "?")[:8]
+
+
+def lock_owner():
+    """PID of a running switch operation, or None."""
+    try:
+        pid = int(LOCK_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def acquire_lock():
+    pid = lock_owner()
+    if pid and pid != os.getpid():
+        die(f"Another switch is already running (pid {pid}). Wait for it to finish.")
+    HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
+    LOCK_FILE.write_text(str(os.getpid()))
+    import atexit
+    atexit.register(lambda: LOCK_FILE.unlink() if lock_owner() in (None, os.getpid()) and LOCK_FILE.exists() else None)
 
 
 # ───────────────────────── state ─────────────────────────
@@ -532,13 +554,17 @@ def cmd_add(args):
     notify(f"Sign in to Claude as '{args.name}'")
     deadline = time.time() + LOGIN_TIMEOUT
     new_acct = None
-    while time.time() < deadline:
-        time.sleep(2)
-        cfg = app_config()
-        a = cfg.get("lastKnownAccountUuid")
-        if a and (cfg.get("oauth:tokenCacheV2") or has_session_cookie()):
-            new_acct = a
-            break
+    signal.signal(signal.SIGTERM, signal.default_int_handler)  # Cancel from the app = roll back
+    try:
+        while time.time() < deadline:
+            time.sleep(2)
+            cfg = app_config()
+            a = cfg.get("lastKnownAccountUuid")
+            if a and (cfg.get("oauth:tokenCacheV2") or has_session_cookie()):
+                new_acct = a
+                break
+    except KeyboardInterrupt:
+        log("Cancelled.")
     if not new_acct:
         log("No sign-in detected. Profile not created, restoring the previous account.")
         quit_app(True)
@@ -618,6 +644,83 @@ def cmd_list(args):
         print(f" ● (not saved)           {short(cur)}  ← current sign-in, save it: claude-switch save <name>")
     if workspace_mismatch(st):
         print("\n ⚠ Chats are under another account, not the current sign-in. Move them: claude-switch sync")
+
+
+def usage_by_org():
+    """Latest plan usage per organization from the app's own history: fh = 5-hour window %, sd = weekly %."""
+    hist = read_json(APP_DIR / "plan-usage-history.json", {}) or {}
+    out = {}
+    for s in sorted(hist.get("samples", []), key=lambda s: s.get("t", 0)):
+        u = s.get("u") or {}
+        e = out.setdefault(s.get("org"), {"history": []})
+        e.update({"fiveHour": u.get("fh"), "weekly": u.get("sd"), "at": s.get("t")})
+        e["history"].append({"t": s.get("t"), "fiveHour": u.get("fh"), "weekly": u.get("sd")})
+    for e in out.values():
+        e["history"] = e["history"][-30:]
+    return out
+
+
+def workspace_stats(acct, org):
+    stats = {"chats": 0, "cowork": 0, "lastActivity": None}
+    for fam, key in (("claude-code-sessions", "chats"), ("local-agent-mode-sessions", "cowork")):
+        d = APP_DIR / fam / acct / org
+        if not d.is_dir():
+            continue
+        files = [f for f in d.iterdir() if f.name.startswith("local_") and f.suffix == ".json"]
+        stats[key] = len(files)
+        if files:
+            last = max(f.stat().st_mtime for f in files)
+            stats["lastActivity"] = max(stats["lastActivity"] or 0, int(last * 1000))
+    return stats
+
+
+def cmd_status(args):
+    """Machine-readable state for the Claude Switch app."""
+    st = load_state()
+    cur = current_account()
+    ws = st.get("workspace")
+    usage = usage_by_org()
+    tokens = (read_json(APP_DIR / "buddy-tokens.json", {}) or {}).get("tokens-today") or {}
+    mode = (read_json(MODE_FILE, {}) or {}).get("deploymentMode")
+    profiles = []
+    for name, p in st["profiles"].items():
+        profiles.append({
+            "name": name,
+            "accountUuid": p["accountUuid"],
+            "orgUuid": p["orgUuid"],
+            "addedAt": p.get("addedAt"),
+            "active": p["accountUuid"] == cur,
+            "hasSavedSignIn": (profile_dir(name) / "auth").is_dir(),
+            "holdsWorkspace": bool(ws) and ws["acct"] == p["accountUuid"],
+            "usage": usage.get(p["orgUuid"]),
+        })
+    out = {
+        "version": VERSION,
+        "currentAccount": cur,
+        "currentProfile": profile_by_acct(st, cur) if cur else None,
+        "workspace": dict(ws, **workspace_stats(ws["acct"], ws["org"])) if ws else None,
+        "mismatch": bool(workspace_mismatch(st)),
+        "busy": lock_owner() is not None,
+        "appMode": mode,
+        "tokensToday": tokens.get("tokens") if tokens.get("date") == datetime.now().strftime("%Y-%m-%d") else 0,
+        "profiles": profiles,
+    }
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_rename(args):
+    st = load_state()
+    if args.old not in st["profiles"]:
+        die(f"No profile '{args.old}'.")
+    if args.new in st["profiles"]:
+        die(f"Profile '{args.new}' already exists.")
+    st["profiles"][args.new] = st["profiles"].pop(args.old)
+    if profile_dir(args.old).exists():
+        profile_dir(args.old).rename(profile_dir(args.new))
+    if st.get("active") == args.old:
+        st["active"] = args.new
+    save_state(st)
+    log(f"Profile '{args.old}' renamed to '{args.new}'")
 
 
 def cmd_remove(args):
@@ -725,6 +828,10 @@ def cmd_install(args):
         log("Add this to ~/.zshrc:  export PATH=\"$HOME/.local/bin:$PATH\"")
     app = Path.home() / "Applications" / "Claude Switch.app"
     app.parent.mkdir(exist_ok=True)
+    if is_native_app(app):
+        log(f"Claude Switch app is already installed: {app}")
+        return
+    # Fallback when the native app isn't available: a tiny AppleScript launcher for the `gui` menu
     py = sys.executable
     src = f'do shell script quoted form of "{py}" & " " & quoted form of "{target}" & " gui"'
     rm(app)
@@ -736,7 +843,22 @@ def cmd_install(args):
     log(f"Switcher app: {app} (find it in Spotlight as 'Claude Switch')")
 
 
+def is_native_app(app):
+    info = read_json_plist(app / "Contents" / "Info.plist")
+    return info.get("CFBundleIdentifier") == APP_BUNDLE_ID
+
+
+def read_json_plist(path):
+    import plistlib
+    try:
+        with open(path, "rb") as f:
+            return plistlib.load(f)
+    except (OSError, plistlib.InvalidFileException):
+        return {}
+
+
 def cmd_uninstall(args):
+    subprocess.run(["osascript", "-e", f'tell application id "{APP_BUNDLE_ID}" to quit'], capture_output=True)
     for p in (Path.home() / ".local/bin/claude-switch", Path.home() / "Applications" / "Claude Switch.app"):
         if p.exists():
             rm(p)
@@ -780,6 +902,11 @@ def main():
     s = sub.add_parser("sync", help="move chats to the account that is signed in now (if you signed in outside the script)")
     s.add_argument("--force", action="store_true", help="force-quit Claude if it doesn't quit on its own")
     sub.add_parser("list", help="list profiles")
+    s = sub.add_parser("status", help="print the full state as JSON (used by the app)")
+    s.add_argument("--json", action="store_true", help="JSON output (the default)")
+    s = sub.add_parser("rename", help="rename a profile")
+    s.add_argument("old")
+    s.add_argument("new")
     s = sub.add_parser("remove", help="remove a profile (only its saved sign-in)")
     s.add_argument("name")
     sub.add_parser("gui", help="account menu in a macOS dialog")
@@ -788,18 +915,24 @@ def main():
     s = sub.add_parser("uninstall", help="remove the CLI and the 'Claude Switch' app")
     s.add_argument("--purge", action="store_true", help="also remove profiles, saved sign-ins and backups")
     args = ap.parse_args()
-    NO_APP = args.no_app
+    NO_APP = NO_APP or args.no_app
     name = getattr(args, "name", None)
-    if name is not None and not name.replace("-", "").replace("_", "").replace(".", "").isalnum():
-        die("Profile name: letters, digits, '-', '_', '.', no spaces.")
+    for n in (name, getattr(args, "new", None)):
+        if n is not None and not n.replace("-", "").replace("_", "").replace(".", "").isalnum():
+            die("Profile name: letters, digits, '-', '_', '.', no spaces.")
 
-    if args.cmd in ("use", "add", "sync") and not os.environ.get("CLAUDE_SWITCH_WORKER") and not NO_APP:
+    switching = args.cmd in ("use", "add", "sync", "_finish-add")
+    if switching and lock_owner():
+        die(f"Another switch is already running (pid {lock_owner()}). Wait for it to finish.")
+    if switching and args.cmd != "_finish-add" and not os.environ.get("CLAUDE_SWITCH_WORKER") and not NO_APP:
         argv = [args.cmd] + ([args.name] if name else []) + (["--force"] if args.force else [])
         sys.exit(run_worker_and_follow(argv))
+    if switching:
+        acquire_lock()
 
     handlers = {"save": cmd_save, "add": cmd_add, "use": cmd_use, "_finish-add": cmd_finish_add, "sync": cmd_sync,
-                "list": cmd_list, "remove": cmd_remove, "gui": cmd_gui, "install": cmd_install,
-                "update": cmd_update, "uninstall": cmd_uninstall}
+                "list": cmd_list, "status": cmd_status, "rename": cmd_rename, "remove": cmd_remove, "gui": cmd_gui,
+                "install": cmd_install, "update": cmd_update, "uninstall": cmd_uninstall}
     if not args.cmd:
         cmd_list(args)
         print("\nCommands: save <name> | add <name> | use <name> | sync | list | remove <name> | gui | update | uninstall"

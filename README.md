@@ -1,10 +1,27 @@
-# claude-switch
+<p align="center">
+  <img src="docs/icon.png" width="128" alt="Claude Switch icon">
+</p>
 
-**English** | [Русский](README.ru.md)
+<h1 align="center">Claude Switch</h1>
 
-**Switch accounts in Claude Desktop on macOS while keeping your local chats shared.**
+<p align="center">
+  <b>English</b> | <a href="README.ru.md">Русский</a>
+</p>
 
-Normally, if you sign out of Claude Desktop and sign in with another account, the Code (and Cowork) tab comes up empty, because local sessions are tied to the account. `claude-switch` remembers the sign-ins of several accounts and switches between them with one command or one click. All your local chats move with you to whichever account is active.
+<p align="center">
+  <b>Switch accounts in Claude Desktop on macOS while keeping your local chats shared.</b><br>
+  A native menu bar app with Liquid Glass, usage limits at a glance, and a CLI.
+</p>
+
+<p align="center">
+  <img src="docs/menu-bar-panel.jpg" width="300" alt="Menu bar panel">
+  &nbsp;
+  <img src="docs/main-window.jpg" width="520" alt="Main window">
+</p>
+
+Normally, if you sign out of Claude Desktop and sign in with another account, the Code (and Cowork) tab comes up empty, because local sessions are tied to the account. Claude Switch remembers the sign-ins of several accounts and switches between them with one click in the menu bar. All your local chats move with you to whichever account is active.
+
+You can also do everything from the terminal:
 
 ```text
 $ claude-switch list
@@ -18,11 +35,13 @@ $ claude-switch use work
 [12:04:13] Switched to 'work'. Launching Claude.
 ```
 
-- **One-click switching.** Use the **Claude Switch** app (Spotlight) or `claude-switch use <name>`.
+- **Lives in the menu bar.** A Control Center-style glass panel shows who you're signed in as, your 5-hour and weekly limits, and every account one click away.
+- **Usage limits for every account.** The current session (5-hour) and weekly limits, with a weekly trend, taken from Claude Desktop's own readings.
+- **One-click switching.** From the menu bar, the app window, or `claude-switch use <name>`.
 - **Shared local workspace.** Code and Cowork sessions, scheduled tasks, sidebar groups, per-folder permission modes and session presets move with every switch.
 - **No signing in again.** Each account's sign-in is saved locally and restored when you switch back.
 - **Backup before every change.** The last 8 are kept in `~/.claude-switch/backups/`.
-- **No dependencies.** One Python file, standard library only.
+- **Native and light.** SwiftUI with real Liquid Glass on macOS 26 and later (vibrancy on older systems); the switching engine is one Python file with no dependencies.
 
 > [!IMPORTANT]
 > This is an unofficial tool and is not affiliated with Anthropic. It relies on Claude Desktop's internal data layout, which may change in a future update. Tested with Claude Desktop 4.4212 on macOS (Apple Silicon).
@@ -34,6 +53,7 @@ $ claude-switch use work
 - [Quick start](#quick-start)
 - [Commands](#commands)
 - [The Claude Switch app](#the-claude-switch-app)
+- [Building from source](#building-from-source)
 - [What is shared and what isn't](#what-is-shared-and-what-isnt)
 - [How it works](#how-it-works)
 - [Backups and recovery](#backups-and-recovery)
@@ -43,7 +63,7 @@ $ claude-switch use work
 
 ## Requirements
 
-- macOS
+- macOS 13 Ventura or later (Liquid Glass needs macOS 26 Tahoe or later)
 - [Claude Desktop](https://claude.ai/download) in `/Applications`
 - Python 3.8+. It comes with the Xcode Command Line Tools; if you don't have them, run `xcode-select --install`
 
@@ -57,8 +77,8 @@ curl -fsSL https://raw.githubusercontent.com/qxlies/claude-switch/main/install.s
 
 The installer:
 
-1. puts the `claude-switch` command in `~/.local/bin` and adds that folder to your `PATH` (in `~/.zshrc`) if needed;
-2. builds the **Claude Switch** app in `~/Applications`, which you can open from Spotlight.
+1. downloads the **Claude Switch** app (universal: Apple Silicon and Intel) from the latest release into `~/Applications` and starts it, so its icon appears in the menu bar;
+2. puts the `claude-switch` command in `~/.local/bin` and adds that folder to your `PATH` (in `~/.zshrc`) if needed.
 
 <details>
 <summary>Manual install from a clone</summary>
@@ -69,11 +89,20 @@ cd claude-switch
 CLAUDE_SWITCH_SRC=./claude-switch ./install.sh
 ```
 
-Or without the installer at all: `python3 claude-switch install`.
+To use an app you built yourself, pass it to the installer: `CLAUDE_SWITCH_APP_ZIP=app/build/ClaudeSwitch.zip`. See [Building from source](#building-from-source).
 
 </details>
 
 ## Quick start
+
+### In the app
+
+1. Click the Claude Switch icon in the menu bar and choose **Open Claude Switch** (the window icon), or open the app from Spotlight.
+2. Click **Save current account** and give it a name, for example `main`.
+3. Click **＋ Add account**, type a name, and press **Continue**. Claude reopens on the sign-in screen: sign in with the second account **with claude.ai**. The app notices the sign-in and moves your chats over.
+4. From now on, switch from the menu bar: hover an account and click **Switch**.
+
+### In the terminal
 
 > [!WARNING]
 > Run these commands from a **regular Terminal**, not from Claude's built-in terminal or chat: switching quits and relaunches Claude. If you do run it from inside Claude, nothing breaks (the work continues in the background), but the window showing the output closes.
@@ -99,7 +128,6 @@ claude-switch use main
 claude-switch use work
 ```
 
-Or open **Claude Switch** from Spotlight and pick an account.
 
 ## Commands
 
@@ -111,8 +139,10 @@ Or open **Claude Switch** from Spotlight and pick an account.
 | `claude-switch add <name>` | Add a new account through the sign-in screen |
 | `claude-switch use <name>` | Switch to a profile |
 | `claude-switch sync` | Move chats to the account that is signed in now (if you signed in outside the script) |
+| `claude-switch rename <old> <new>` | Rename a profile |
+| `claude-switch status` | Print the full state as JSON (accounts, limits, workspace); the app uses this |
 | `claude-switch remove <name>` | Remove a profile: only its saved sign-in, chats are not touched |
-| `claude-switch gui` | Account menu in a macOS dialog |
+| `claude-switch gui` | Simple account menu in a macOS dialog (fallback without the app) |
 | `claude-switch update` | Update to the latest version |
 | `claude-switch uninstall [--purge]` | Uninstall; `--purge` also removes profiles and backups |
 | `claude-switch --version` | Show the version |
@@ -123,17 +153,32 @@ Profile names can contain letters, digits, `-`, `_` and `.`, with no spaces.
 
 ## The Claude Switch app
 
-The installer adds a **Claude Switch** app to `~/Applications`. Open it from Spotlight (`⌘ Space` → "Claude Switch") or keep it in the Dock. It shows your accounts:
+### Menu bar panel
 
-- `● main`: the account you are signed in to right now;
-- **＋ Add account…**: same as `add`;
-- **Save current sign-in as…**: shown when the current sign-in isn't saved yet;
-- **⟳ Move chats to the current account**: shown when your chats are under a different account.
+Click the icon in the menu bar (it can also show the active account's weekly usage next to it). A floating glass panel, styled like Control Center, opens with:
 
-Progress and errors arrive as macOS notifications. A detailed log is written to `~/.claude-switch/switch.log`.
+- **who you're signed in as**, how many shared chats there are, and whether Claude is open;
+- **usage limits**: the current 5-hour session and the weekly limit, with the time of the last reading;
+- **your accounts**, each with its own limits; hover one and click **Switch**;
+- **＋ Add account**, settings and quit.
+
+While a switch is running, the panel shows its progress. If you signed in to another account directly in Claude, it offers to **move your chats** to it.
+
+### Main window
+
+Open it from the panel or from Spotlight. The sidebar lists your accounts; for each one you see:
+
+- usage rings for the 5-hour and weekly limits and a weekly trend;
+- the shared workspace: Code chats, Cowork sessions, last activity and tokens used today;
+- **Switch to …** (or **Open Claude** for the active account) and a **…** menu with Rename, Backups, Log and Remove.
+
+**Settings** has: launch at login, show weekly usage in the menu bar, keep the icon in the Dock (by default it appears only while the window is open), and installing the `claude-switch` command.
 
 > [!NOTE]
-> The first time you use it, macOS may ask whether Claude Switch can control Claude. Allow it, otherwise it can't quit and relaunch Claude.
+> Limits come from Claude Desktop's own readings (`plan-usage-history.json`), so an account's numbers refresh while you use it. For other accounts you see their last known values. A 5-hour reading older than five hours is shown dimmed, because that window has already reset.
+
+> [!NOTE]
+> The first time you switch, macOS asks whether Claude Switch can control Claude. Allow it, otherwise it can't quit and relaunch Claude.
 
 ## What is shared and what isn't
 
@@ -188,6 +233,27 @@ switch.log            log of background operations
 ```
 
 </details>
+
+## Building from source
+
+You need the Xcode Command Line Tools (`xcode-select --install`).
+
+```bash
+git clone https://github.com/qxlies/claude-switch.git
+cd claude-switch
+./app/build.sh --zip                       # → app/build/Claude Switch.app and ClaudeSwitch.zip
+CLAUDE_SWITCH_SRC=./claude-switch CLAUDE_SWITCH_APP_ZIP=app/build/ClaudeSwitch.zip ./install.sh
+```
+
+The app is built with plain `swiftc` (no Xcode project), as a universal binary, ad-hoc signed. It finds Liquid Glass (`NSGlassEffectView`) at runtime, so it builds with older SDKs and falls back to vibrancy on macOS versions before 26.
+
+```text
+claude-switch          the switching engine (Python, stdlib only); the app bundles a copy
+install.sh             installer
+app/Sources/           SwiftUI app: menu bar panel, main window, glass components
+app/tools/make-icon.swift   draws the app icon
+app/build.sh           builds, bundles, signs and zips the app
+```
 
 ## Backups and recovery
 

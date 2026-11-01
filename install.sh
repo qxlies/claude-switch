@@ -34,7 +34,29 @@ fi
 head -1 "$tmp/claude-switch" | grep -q python3 || fail "The downloaded file doesn't look like claude-switch."
 chmod +x "$tmp/claude-switch"
 
-say "Installing…"
+# The native menu bar app (prebuilt, universal) from the latest GitHub release
+APP_DIR="$HOME/Applications"
+APP="$APP_DIR/Claude Switch.app"
+app_zip="${CLAUDE_SWITCH_APP_ZIP:-}"
+if [ -z "$app_zip" ]; then
+  say "Downloading the Claude Switch app…"
+  if curl -fsSL "https://github.com/${REPO}/releases/latest/download/ClaudeSwitch.zip" -o "$tmp/ClaudeSwitch.zip"; then
+    app_zip="$tmp/ClaudeSwitch.zip"
+  else
+    warn "Could not download the app; installing the simple menu launcher instead."
+  fi
+fi
+if [ -n "$app_zip" ]; then
+  osascript -e 'tell application id "io.github.qxlies.claude-switch" to quit' >/dev/null 2>&1 || true
+  mkdir -p "$APP_DIR" "$tmp/app"
+  ditto -x -k "$app_zip" "$tmp/app"
+  [ -d "$tmp/app/Claude Switch.app" ] || fail "The app archive is broken."
+  rm -rf "$APP"
+  mv "$tmp/app/Claude Switch.app" "$APP"
+  xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+fi
+
+say "Installing the command…"
 CLAUDE_SWITCH_INSTALLER=1 python3 "$tmp/claude-switch" install
 
 # Put ~/.local/bin on PATH
@@ -56,13 +78,16 @@ echo
 say "Done: $version"
 cat <<'EOF'
 
-  Getting started (from a regular Terminal, not from inside Claude):
+  Claude Switch now lives in your menu bar (top right of the screen).
+  Click it to see your accounts and usage limits, or open the app from Spotlight.
+
+  Prefer the terminal? (run it from Terminal, not from inside Claude)
 
     claude-switch save main     # remember the current account
     claude-switch add work      # sign in to a second account
     claude-switch use main      # switch between them
 
-  Or open the "Claude Switch" app from Spotlight (⌘ Space).
   Help: claude-switch --help
 
 EOF
+if [ -d "$APP" ] && [ -z "${CLAUDE_SWITCH_NO_LAUNCH:-}" ]; then open "$APP"; fi
