@@ -14,9 +14,9 @@
 </p>
 
 <p align="center">
-  <img src="docs/menu-bar-panel.jpg" width="300" alt="Menu bar panel">
+  <img src="docs/menu-bar-panel.png" width="300" alt="Menu bar panel">
   &nbsp;
-  <img src="docs/main-window.jpg" width="520" alt="Main window">
+  <img src="docs/main-window.png" width="520" alt="Main window">
 </p>
 
 Normally, if you sign out of Claude Desktop and sign in with another account, the Code (and Cowork) tab comes up empty, because local sessions are tied to the account. Claude Switch remembers the sign-ins of several accounts and switches between them with one click in the menu bar. All your local chats move with you to whichever account is active.

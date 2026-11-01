@@ -14,9 +14,9 @@
 </p>
 
 <p align="center">
-  <img src="docs/menu-bar-panel.jpg" width="300" alt="Панель в строке меню">
+  <img src="docs/menu-bar-panel.png" width="300" alt="Панель в строке меню">
   &nbsp;
-  <img src="docs/main-window.jpg" width="520" alt="Основное окно">
+  <img src="docs/main-window.png" width="520" alt="Основное окно">
 </p>
 
 Обычно, если выйти из Claude Desktop и войти в другой аккаунт, вкладка Code (и Cowork) оказывается пустой: локальные сессии привязаны к аккаунту. Claude Switch хранит входы нескольких аккаунтов и переключает их одним кликом в строке меню, а все локальные чаты переезжают вместе с тобой в тот аккаунт, который сейчас активен.

@@ -76,7 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var previewWindow: NSWindow?
 
     private func showPanelPreview() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: MenuBarController.width + 40, height: 620),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: MenuBarController.width + 60, height: 620),
                          styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
         w.titlebarAppearsTransparent = true
         w.titleVisibility = .hidden
@@ -86,10 +86,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let root = MenuPanelView(onHeight: { [weak w] h in
             guard let w else { return }
             var f = w.frame
-            f.origin.y += f.height - (h + 60)
-            f.size.height = h + 60
+            let target = h + 60
+            f.origin.y += f.height - target
+            f.size.height = target
             w.setFrame(f, display: true)
-        }, openMain: { _ in }, close: {}).environmentObject(Store.shared).padding(.top, 30).padding(.horizontal, 20)
+        }, openMain: { _ in }, close: {}).environmentObject(Store.shared).padding(.horizontal, 30)
+            .frame(maxWidth: .infinity, maxHeight: .infinity).ignoresSafeArea()
             .background(  // a wallpaper-like backdrop so the glass has something to refract in screenshots
                 ZStack {
                     LinearGradient(colors: [Color(red: 0.95, green: 0.55, blue: 0.40), Color(red: 0.45, green: 0.25, blue: 0.55)],
@@ -100,6 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 .ignoresSafeArea()
             )
         w.contentView = NSHostingView(rootView: root)
+        for b in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] { w.standardWindowButton(b)?.isHidden = true }
         w.center()
         w.makeKeyAndOrderFront(nil)
         previewWindow = w
