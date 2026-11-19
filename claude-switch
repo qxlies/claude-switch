@@ -17,6 +17,10 @@ How Claude Desktop (4.4xxx) stores things:
     "claude.ai" choice (deploymentMode in <userData>-3p/claude_desktop_config.json) and relaunches into
     Gateway. So the script sets deploymentMode=1p and launches the app with --claude-first-party-sign-in,
     the same way the app does when you pick "sign in with claude.ai".
+  * Sidebar sections and groups, permission modes and other per-account settings live in the claude.ai
+    origin's localStorage (keys "LSS-persisted.*", a LevelDB database under "Local Storage"), which is
+    saved per account with the sign-in. claude_desktop_config.json is only a mirror that the app rewrites
+    from there on startup, so these settings are copied in the localStorage as well.
 
 Everything is done while the app is closed. A backup is made before every switch.
 """
@@ -27,6 +31,7 @@ import os
 import shutil
 import signal
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
@@ -347,6 +352,317 @@ def restore_auth(name):
     return True
 
 
+# ───────────────────────── Local Storage (LevelDB) ─────────────────────────
+# The app keeps some settings (the sidebar's sections and groups among them) in the claude.ai origin's
+# localStorage, which Chromium stores as a LevelDB database in <userData>/Local Storage/leveldb. On startup
+# it rewrites claude_desktop_config.json from there, so a copy made only in the JSON file is lost.
+# Below is a small LevelDB reader and writer (standard library only). Reading takes the live tables listed
+# in the MANIFEST plus the logs; writing adds a new log file that LevelDB replays the next time it opens.
+# Both run only while the app is closed.
+
+LDB_BLOCK = 32768
+LDB_TABLE_MAGIC = 0xDB4775248B80FB57
+
+
+def _varint(buf, pos):
+    result = shift = 0
+    while True:
+        b = buf[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if b < 0x80:
+            return result, pos
+        shift += 7
+
+
+def _put_varint(n):
+    out = bytearray()
+    while n >= 0x80:
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+
+
+def _lenprefixed(buf, pos):
+    n, pos = _varint(buf, pos)
+    return buf[pos:pos + n], pos + n
+
+
+_CRC32C = []
+
+
+def _crc32c(data):
+    if not _CRC32C:
+        for i in range(256):
+            c = i
+            for _ in range(8):
+                c = (c >> 1) ^ 0x82F63B78 if c & 1 else c >> 1
+            _CRC32C.append(c)
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc = _CRC32C[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return crc ^ 0xFFFFFFFF
+
+
+def _masked_crc(data):
+    c = _crc32c(data)
+    return ((((c >> 15) | (c << 17)) & 0xFFFFFFFF) + 0xA282EAD8) & 0xFFFFFFFF
+
+
+def _snappy_decompress(buf):
+    size, pos = _varint(buf, 0)
+    out = bytearray()
+    while pos < len(buf):
+        tag = buf[pos]
+        pos += 1
+        kind = tag & 3
+        if kind == 0:  # literal
+            n = tag >> 2
+            if n >= 60:
+                nb = n - 59
+                n = int.from_bytes(buf[pos:pos + nb], "little")
+                pos += nb
+            n += 1
+            out += buf[pos:pos + n]
+            pos += n
+            continue
+        if kind == 1:
+            n, off = ((tag >> 2) & 7) + 4, ((tag >> 5) << 8) | buf[pos]
+            pos += 1
+        elif kind == 2:
+            n, off = (tag >> 2) + 1, int.from_bytes(buf[pos:pos + 2], "little")
+            pos += 2
+        else:
+            n, off = (tag >> 2) + 1, int.from_bytes(buf[pos:pos + 4], "little")
+            pos += 4
+        if not 0 < off <= len(out):
+            raise ValueError("snappy: bad copy offset")
+        start = len(out) - off
+        if off >= n:
+            out += out[start:start + n]
+        else:  # overlapping copy repeats the last `off` bytes
+            for i in range(n):
+                out.append(out[start + i])
+    if len(out) != size:
+        raise ValueError("snappy: bad length")
+    return bytes(out)
+
+
+def _log_records(data):
+    """Logical records of a LevelDB log file. Stops at the first damaged or unfinished record."""
+    pos, frag = 0, None
+    while pos + 7 <= len(data):
+        left = LDB_BLOCK - pos % LDB_BLOCK
+        if left < 7:  # block trailer
+            pos += left
+            continue
+        crc, n, kind = struct.unpack_from("<IHB", data, pos)
+        body = data[pos + 7:pos + 7 + n]
+        if kind == 0 or len(body) < n or _masked_crc(bytes([kind]) + body) != crc:
+            return
+        pos += 7 + n
+        if kind == 1:  # FULL
+            frag = None
+            yield body
+        elif kind == 2:  # FIRST
+            frag = bytearray(body)
+        elif kind == 3 and frag is not None:  # MIDDLE
+            frag += body
+        elif kind == 4 and frag is not None:  # LAST
+            frag += body
+            yield bytes(frag)
+            frag = None
+
+
+def _log_encode(record):
+    """One record in LevelDB log format, for a new file (so it starts at a block boundary)."""
+    out, pos, first = bytearray(), 0, True
+    while True:
+        left = LDB_BLOCK - len(out) % LDB_BLOCK
+        if left < 7:
+            out += b"\0" * left
+            left = LDB_BLOCK
+        chunk = record[pos:pos + left - 7]
+        pos += len(chunk)
+        last = pos >= len(record)
+        kind = 1 if first and last else 2 if first else 4 if last else 3
+        out += struct.pack("<IHB", _masked_crc(bytes([kind]) + chunk), len(chunk), kind) + chunk
+        first = False
+        if last:
+            return bytes(out)
+
+
+def _batch_entries(rec):
+    """(sequence, key, value-or-None) for every operation in a WriteBatch."""
+    seq, count = struct.unpack_from("<QI", rec, 0)
+    pos = 12
+    for i in range(count):
+        kind = rec[pos]
+        key, pos = _lenprefixed(rec, pos + 1)
+        val = None
+        if kind == 1:
+            val, pos = _lenprefixed(rec, pos)
+        yield seq + i, bytes(key), None if val is None else bytes(val)
+
+
+def _table_block(data, offset, size):
+    raw = data[offset:offset + size]
+    kind = data[offset + size]
+    if kind == 1:
+        return _snappy_decompress(raw)
+    if kind != 0:
+        raise ValueError(f"table: unknown block compression {kind}")
+    return raw
+
+
+def _block_entries(block):
+    restarts = struct.unpack_from("<I", block, len(block) - 4)[0]
+    end = len(block) - 4 - 4 * restarts
+    pos, key = 0, b""
+    while pos < end:
+        shared, pos = _varint(block, pos)
+        unshared, pos = _varint(block, pos)
+        vlen, pos = _varint(block, pos)
+        key = key[:shared] + block[pos:pos + unshared]
+        pos += unshared
+        yield key, block[pos:pos + vlen]
+        pos += vlen
+
+
+def _table_entries(data):
+    """(sequence, key, value-or-None) for every entry of an .ldb table."""
+    if len(data) < 48 or struct.unpack_from("<Q", data, len(data) - 8)[0] != LDB_TABLE_MAGIC:
+        raise ValueError("table: bad footer")
+    pos = len(data) - 48
+    _, pos = _varint(data, pos)  # metaindex handle
+    _, pos = _varint(data, pos)
+    idx_off, pos = _varint(data, pos)
+    idx_size, pos = _varint(data, pos)
+    for _, handle in _block_entries(_table_block(data, idx_off, idx_size)):
+        off, p = _varint(handle, 0)
+        size, _ = _varint(handle, p)
+        for ikey, val in _block_entries(_table_block(data, off, size)):
+            tag = struct.unpack_from("<Q", ikey, len(ikey) - 8)[0]
+            yield tag >> 8, bytes(ikey[:-8]), bytes(val) if tag & 0xFF == 1 else None
+
+
+def _manifest(dbdir):
+    """Live table numbers, log numbers and counters from the MANIFEST that CURRENT points to."""
+    name = (dbdir / "CURRENT").read_text().strip()
+    st = {"files": set(), "log": 0, "prev_log": 0, "next": 0, "last_seq": 0}
+    for rec in _log_records((dbdir / name).read_bytes()):
+        pos = 0
+        while pos < len(rec):
+            tag, pos = _varint(rec, pos)
+            if tag == 1:  # comparator
+                cmp_name, pos = _lenprefixed(rec, pos)
+                if bytes(cmp_name) != b"leveldb.BytewiseComparator":
+                    raise ValueError(f"unexpected comparator {bytes(cmp_name)!r}")
+            elif tag in (2, 3, 4, 9):
+                v, pos = _varint(rec, pos)
+                st[{2: "log", 3: "next", 4: "last_seq", 9: "prev_log"}[tag]] = v
+            elif tag == 5:  # compact pointer
+                _, pos = _varint(rec, pos)
+                _, pos = _lenprefixed(rec, pos)
+            elif tag == 6:  # deleted file
+                _, pos = _varint(rec, pos)
+                num, pos = _varint(rec, pos)
+                st["files"].discard(num)
+            elif tag == 7:  # new file
+                _, pos = _varint(rec, pos)
+                num, pos = _varint(rec, pos)
+                _, pos = _varint(rec, pos)
+                _, pos = _lenprefixed(rec, pos)
+                _, pos = _lenprefixed(rec, pos)
+                st["files"].add(num)
+            else:
+                raise ValueError(f"MANIFEST: unknown tag {tag}")
+    return st
+
+
+def _numbered(dbdir, suffix):
+    out = {}
+    for p in dbdir.iterdir():
+        if p.suffix == suffix and p.stem.isdigit():
+            out[int(p.stem)] = p
+    return out
+
+
+def ldb_read(dbdir):
+    """All live key/value pairs of a closed LevelDB database, and its highest sequence number."""
+    dbdir = Path(dbdir)
+    st = _manifest(dbdir)
+    best = {}
+    top = st["last_seq"]
+
+    def put(seq, key, val):
+        nonlocal top
+        top = max(top, seq)
+        if key not in best or best[key][0] < seq:
+            best[key] = (seq, val)
+
+    tables = {**_numbered(dbdir, ".sst"), **_numbered(dbdir, ".ldb")}
+    for num in st["files"]:
+        if num not in tables:
+            raise FileNotFoundError(f"table {num:06d}.ldb listed in the MANIFEST is missing")
+        for e in _table_entries(tables[num].read_bytes()):
+            put(*e)
+    for num, p in sorted(_numbered(dbdir, ".log").items()):
+        if num >= st["log"] or num == st["prev_log"]:
+            for rec in _log_records(p.read_bytes()):
+                for e in _batch_entries(rec):
+                    put(*e)
+    return {k: v for k, (_, v) in best.items() if v is not None}, top
+
+
+def ldb_write(dbdir, updates):
+    """Apply {key: value, or None to delete} as one batch in a new log file."""
+    if not updates:
+        return
+    dbdir = Path(dbdir)
+    st = _manifest(dbdir)
+    _, top = ldb_read(dbdir)
+    batch = bytearray(struct.pack("<QI", top + 1, len(updates)))
+    for key, val in updates.items():
+        batch += (b"\x00" if val is None else b"\x01") + _put_varint(len(key)) + key
+        if val is not None:
+            batch += _put_varint(len(val)) + val
+    used = [int(p.stem) for p in dbdir.iterdir() if p.stem.isdigit()]
+    num = max([st["next"], st["log"] + 1] + [n + 1 for n in used])
+    tmp = dbdir / f"{num:06d}.log.tmp"
+    tmp.write_bytes(_log_encode(bytes(batch)))
+    tmp.rename(dbdir / f"{num:06d}.log")
+
+
+# Chromium's localStorage rows: "_<origin>\0" + key and value, each a 1-byte encoding tag + text
+LS_ORIGIN = "https://claude.ai"
+
+
+def _ls_decode(b):
+    return b[1:].decode("latin-1") if b[:1] == b"\x01" else b[1:].decode("utf-16-le")
+
+
+def _ls_encode(s):
+    try:
+        return b"\x01" + s.encode("latin-1")
+    except UnicodeEncodeError:
+        return b"\x00" + s.encode("utf-16-le")
+
+
+def ls_read(storage_dir, origin=LS_ORIGIN):
+    """{key: text} of one origin's localStorage in a (closed) "Local Storage" folder."""
+    prefix = b"_" + origin.encode() + b"\x00"
+    rows, _ = ldb_read(Path(storage_dir) / "leveldb")
+    return {_ls_decode(k[len(prefix):]): _ls_decode(v) for k, v in rows.items() if k.startswith(prefix)}
+
+
+def ls_write(storage_dir, items, origin=LS_ORIGIN):
+    """Set {key: text} in one origin's localStorage."""
+    prefix = b"_" + origin.encode() + b"\x00"
+    ldb_write(Path(storage_dir) / "leveldb", {prefix + _ls_encode(k): _ls_encode(v) for k, v in items.items()})
+
+
 # ───────────────────────── workspace ─────────────────────────
 
 def merge_move(src, dst, conflicts):
@@ -413,6 +729,76 @@ def copy_prefs(src_acct, src_org, dst_acct, dst_org):
     if d and src_acct in d.get("byAccount", {}):
         d["byAccount"][dst_acct] = copy.deepcopy(d["byAccount"][src_acct])
         write_json(path, d)
+
+
+# localStorage keys that mirror what copy_prefs copies: "LSS-persisted.<epitaxyPrefs key>" and the presets
+LS_PREF_PREFIXES = ("LSS-persisted.", "persisted.ccd-session-presets.")
+
+
+def _ls_pairs(j):
+    """The dict that maps "<acct>/<org>" to a value inside a persisted setting ({"value": {...}, ...})."""
+    if isinstance(j, dict) and isinstance(j.get("value"), dict):
+        return j["value"]
+    return j if isinstance(j, dict) else None
+
+
+def copy_local_storage(src_dir, src_acct, src_org, dst_acct, dst_org, bdir):
+    """The copy_prefs rules applied to the app's localStorage, which is what the app actually reads:
+    take the settings from the source account's saved Local Storage and write them into the one the app
+    will open now. Never fails a switch: on any error it logs a warning and leaves the target as it was."""
+    dst_dir = APP_DIR / "Local Storage"
+    if (src_acct, src_org) == (dst_acct, dst_org):
+        return
+    if not (src_dir / "leveldb").is_dir() or not (dst_dir / "leveldb").is_dir():
+        return
+    try:
+        src, dst = ls_read(src_dir), ls_read(dst_dir)
+    except Exception as e:  # noqa: BLE001 (an unexpected database must not stop the switch)
+        log(f"Warning: could not read Claude's Local Storage ({e}). Sidebar sections were not carried over.")
+        return
+    src_pair, dst_pair = f"{src_acct}/{src_org}", f"{dst_acct}/{dst_org}"
+    now = int(time.time() * 1000)
+    out = {}
+    for k, raw in src.items():
+        if not k.startswith(LS_PREF_PREFIXES) or any(x in k for x in PREF_DENY):
+            continue
+        if k.endswith("." + src_acct):  # "<pref>.<acct>", sometimes "<pref>.<org>.<acct>"
+            nk = k[: -len(src_acct)] + dst_acct
+            out[nk.replace(f".{src_org}.", f".{dst_org}.")] = raw
+            continue
+        try:
+            sj = json.loads(raw)
+        except ValueError:
+            continue
+        sp = _ls_pairs(sj)
+        if not sp or src_pair not in sp:
+            continue
+        try:
+            dj = json.loads(dst[k]) if k in dst else None
+        except ValueError:
+            dj = None
+        dp = _ls_pairs(dj)
+        if dp is not None and dp.get(dst_pair) == sp[src_pair]:
+            continue  # already the same
+        if dp is None:
+            dj = copy.deepcopy(sj)
+            dp = _ls_pairs(dj)
+        dp[dst_pair] = copy.deepcopy(sp[src_pair])
+        if isinstance(dj, dict) and "timestamp" in dj:
+            dj["timestamp"] = now
+        out[k] = json.dumps(dj, separators=(",", ":"), ensure_ascii=False)
+    out = {k: v for k, v in out.items() if dst.get(k) != v}
+    if not out:
+        return
+    shutil.copytree(dst_dir, bdir / "Local Storage", symlinks=True, dirs_exist_ok=True)
+    try:
+        ls_write(dst_dir, out)
+    except Exception as e:  # noqa: BLE001
+        for p in (dst_dir / "leveldb").glob("*.log.tmp"):
+            p.unlink()
+        log(f"Warning: could not write Claude's Local Storage ({e}). Sidebar sections were not carried over.")
+        return
+    log(f"Carried {len(out)} setting(s) over in Claude's Local Storage (sidebar sections and groups among them)")
 
 
 def make_backup(tag):
@@ -489,6 +875,10 @@ def attach_workspace(st, name, bdir):
     if ws:
         move_workspace(ws["acct"], ws["org"], tp["accountUuid"], tp["orgUuid"], bdir)
         copy_prefs(ws["acct"], ws["org"], tp["accountUuid"], tp["orgUuid"])
+        src_name = profile_by_acct(st, ws["acct"])
+        if src_name and src_name != name:
+            copy_local_storage(profile_dir(src_name) / "auth" / "Local Storage",
+                               ws["acct"], ws["org"], tp["accountUuid"], tp["orgUuid"], bdir)
     st["workspace"] = {"acct": tp["accountUuid"], "org": tp["orgUuid"]}
     st["active"] = name
     save_state(st)
