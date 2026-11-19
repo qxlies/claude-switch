@@ -18,9 +18,10 @@ How Claude Desktop (4.4xxx) stores things:
     Gateway. So the script sets deploymentMode=1p and launches the app with --claude-first-party-sign-in,
     the same way the app does when you pick "sign in with claude.ai".
   * Sidebar sections and groups, permission modes and other per-account settings live in the claude.ai
-    origin's localStorage (keys "LSS-persisted.*", a LevelDB database under "Local Storage"), which is
-    saved per account with the sign-in. claude_desktop_config.json is only a mirror that the app rewrites
-    from there on startup, so these settings are copied in the localStorage as well.
+    origin's localStorage (a LevelDB database under "Local Storage"), which is saved per account with the
+    sign-in. The sidebar's source is the "dframe-store" store (codeSidebarByScope, customGroupsByScope);
+    the app derives the "LSS-persisted.*" keys and claude_desktop_config.json from it on startup. So these
+    settings are copied in the localStorage as well, the store included.
 
 Everything is done while the app is closed. A backup is made before every switch.
 """
@@ -733,6 +734,32 @@ def copy_prefs(src_acct, src_org, dst_acct, dst_org):
 
 # localStorage keys that mirror what copy_prefs copies: "LSS-persisted.<epitaxyPrefs key>" and the presets
 LS_PREF_PREFIXES = ("LSS-persisted.", "persisted.ccd-session-presets.")
+# Persisted app stores ({"state": {...}, "version": n}) whose state fields map "<acct>/<org>" to a value.
+# "dframe-store" is the sidebar's source of truth (codeSidebarByScope = sections, customGroupsByScope =
+# groups and which session is in which): on startup the app regenerates the LSS-persisted.dframe-* keys
+# and the JSON mirror from it, so copying only those is undone a second after launch.
+LS_STORES = ("dframe-store",)
+
+
+def _copy_store_scopes(src_raw, dst_raw, src_pair, dst_pair):
+    """dst store JSON with every per-scope field of src's state copied from src_pair to dst_pair, or None."""
+    try:
+        ss, dj = json.loads(src_raw).get("state"), json.loads(dst_raw)
+    except (ValueError, AttributeError):
+        return None
+    ds = dj.get("state") if isinstance(dj, dict) else None
+    if not isinstance(ss, dict) or not isinstance(ds, dict):
+        return None
+    changed = False
+    for field, v in ss.items():
+        if isinstance(v, dict) and src_pair in v:
+            target = ds.get(field)
+            if not isinstance(target, dict):
+                target = ds[field] = {}
+            if target.get(dst_pair) != v[src_pair]:
+                target[dst_pair] = copy.deepcopy(v[src_pair])
+                changed = True
+    return json.dumps(dj, separators=(",", ":"), ensure_ascii=False) if changed else None
 
 
 def _ls_pairs(j):
@@ -787,6 +814,11 @@ def copy_local_storage(src_dir, src_acct, src_org, dst_acct, dst_org, bdir):
         if isinstance(dj, dict) and "timestamp" in dj:
             dj["timestamp"] = now
         out[k] = json.dumps(dj, separators=(",", ":"), ensure_ascii=False)
+    for k in LS_STORES:
+        if k in src and k in dst:
+            merged = _copy_store_scopes(src[k], dst[k], src_pair, dst_pair)
+            if merged:
+                out[k] = merged
     out = {k: v for k, v in out.items() if dst.get(k) != v}
     if not out:
         return
